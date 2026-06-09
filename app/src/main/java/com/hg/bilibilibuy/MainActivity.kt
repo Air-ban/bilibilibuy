@@ -33,6 +33,7 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
@@ -58,6 +59,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -67,6 +69,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val DEFAULT_SERVER_URL = "http://10.0.2.2:8000"
+private const val PROJECT_REPOSITORY_URL = "https://github.com/Air-ban/bilibilibuy"
 private const val PREFS_NAME = "bili_buy_settings"
 private const val KEY_SERVER_URL = "server_url"
 private const val KEY_CUSTOM_SERVER_URL = "custom_server_url"
@@ -688,6 +691,45 @@ private fun SettingsScreen(
                     ActionIndicator(state = connectionState)
                 }
                 ActionStatus(message = healthMessage, state = connectionState)
+            }
+        }
+
+        item {
+            SectionCard(title = "关于项目") {
+                Text(
+                    text = "bilibilibuy 是用于配合 bilibili 购票 API 服务的 Android 客户端。",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(10.dp))
+                Text(
+                    text = "开发者：溪落",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = "版本：v1.0",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(modifier = Modifier.height(12.dp))
+                val context = LocalContext.current
+                OutlinedButton(
+                    onClick = {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(PROJECT_REPOSITORY_URL))
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.ic_github_mark),
+                        contentDescription = "GitHub",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.size(8.dp))
+                    Text("GitHub 仓库")
+                }
             }
         }
     }
