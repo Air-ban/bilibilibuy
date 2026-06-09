@@ -309,7 +309,7 @@ class BiliApiClient(private val baseUrl: String) {
     ): ManagedTaskStartResult {
         val body = JSONObject()
             .put("config", configFile)
-            .put("show_random_message", true)
+            .put("show_random_message", false)
         if (timeStart.isNotBlank()) {
             body.put("time_start", timeStart)
         }
@@ -324,14 +324,17 @@ class BiliApiClient(private val baseUrl: String) {
         }
         val json = postJson("/api/task/start-managed", body)
         val validation = json.optJSONObject("validation") ?: JSONObject()
+        val run = json.optJSONObject("run") ?: JSONObject()
         return ManagedTaskStartResult(
             ok = json.optBoolean("ok"),
-            runId = json.optString("run_id"),
-            runDir = json.optString("run_dir"),
-            pid = json.optLong("pid"),
+            runId = json.optString("run_id").ifBlank { run.optString("run_id") },
+            runDir = json.optString("run_dir").ifBlank {
+                run.optString("run_dir").ifBlank { run.optString("result_path") }
+            },
+            pid = json.optLong("pid").takeIf { it > 0 } ?: run.optLong("pid"),
             errors = validation.optJSONArray("errors").toStringList(),
             warnings = validation.optJSONArray("warnings").toStringList(),
-            error = json.optString("error")
+            error = json.optString("error").ifBlank { run.optString("error") }
         )
     }
 

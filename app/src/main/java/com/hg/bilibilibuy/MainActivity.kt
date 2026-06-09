@@ -57,18 +57,21 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.hg.bilibilibuy.ui.theme.BilibilibuyTheme
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val DEFAULT_SERVER_URL = "http://10.0.2.2:8000"
 private const val PREFS_NAME = "bili_buy_settings"
 private const val KEY_SERVER_URL = "server_url"
+private const val KEY_CUSTOM_SERVER_URL = "custom_server_url"
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -97,6 +100,13 @@ private enum class AppTab(
     Result("生成结果", "结果", "R")
 }
 
+private enum class ActionState {
+    Idle,
+    Loading,
+    Success,
+    Error
+}
+
 @Composable
 fun BiliBuyApp() {
     val context = LocalContext.current
@@ -106,11 +116,22 @@ fun BiliBuyApp() {
     val scope = rememberCoroutineScope()
 
     var currentTab by remember { mutableStateOf(AppTab.Settings) }
-    var serverUrl by remember {
-        mutableStateOf(prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL)
+    val initialServerUrl = remember {
+        prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
     }
+    var serverUrl by remember { mutableStateOf(initialServerUrl) }
+    var customServerUrl by remember {
+        mutableStateOf(
+            prefs.getString(KEY_CUSTOM_SERVER_URL, "")?.ifBlank {
+                initialServerUrl.takeIf { it != DEFAULT_SERVER_URL }.orEmpty()
+            }.orEmpty()
+        )
+    }
+    var useCustomServer by remember { mutableStateOf(initialServerUrl != DEFAULT_SERVER_URL) }
     var healthMessage by remember { mutableStateOf("未测试连接") }
+    var serverConnectionState by remember { mutableStateOf(ActionState.Idle) }
     var authMessage by remember { mutableStateOf("未检查登录状态") }
+    var authActionState by remember { mutableStateOf(ActionState.Idle) }
     var qrLogin by remember { mutableStateOf<QrLogin?>(null) }
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isBusy by remember { mutableStateOf(false) }
@@ -130,6 +151,7 @@ fun BiliBuyApp() {
     var configFiles by remember { mutableStateOf<List<ConfigFile>>(emptyList()) }
     var configBindings by remember { mutableStateOf<List<ConfigBinding>>(emptyList()) }
     var filesMessage by remember { mutableStateOf("未加载配置文件") }
+    var filesActionState by remember { mutableStateOf(ActionState.Idle) }
     var bindingUsernameFilter by remember { mutableStateOf("") }
     var selectedTaskConfig by remember { mutableStateOf("") }
     var taskTimeStart by remember { mutableStateOf("") }
@@ -137,13 +159,23 @@ fun BiliBuyApp() {
     var taskProxy by remember { mutableStateOf("") }
     var taskRunIdInput by remember { mutableStateOf("") }
     var taskMessage by remember { mutableStateOf("请选择已有配置文件启动托管任务") }
+    var taskActionState by remember { mutableStateOf(ActionState.Idle) }
+    var isTaskPolling by remember { mutableStateOf(false) }
+    var managedTaskPollingJob by remember { mutableStateOf<Job?>(null) }
     var currentManagedRunId by remember { mutableStateOf("") }
     var managedTaskStatus by remember { mutableStateOf<ManagedTaskStatus?>(null) }
 
-    fun api() = BiliApiClient(serverUrl)
+    fun activeServerUrl() = if (useCustomServer) customServerUrl.trim() else DEFAULT_SERVER_URL
+
+    fun api() = BiliApiClient(activeServerUrl())
 
     fun saveServerUrl() {
-        prefs.edit().putString(KEY_SERVER_URL, serverUrl.trim()).apply()
+        val selectedUrl = activeServerUrl()
+        serverUrl = selectedUrl
+        prefs.edit()
+            .putString(KEY_SERVER_URL, selectedUrl)
+            .putString(KEY_CUSTOM_SERVER_URL, customServerUrl.trim())
+            .apply()
     }
 
     fun resetSelections(contextData: PurchaseContext) {
@@ -163,10 +195,14 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            serverConnectionState = ActionState.Loading
+            healthMessage = "正在连接服务器..."
             val health = api().health()
             healthMessage = if (health.ok) {
+                serverConnectionState = ActionState.Success
                 "连接成功，版本 ${health.version.ifBlank { "未知" }}"
             } else {
+                serverConnectionState = ActionState.Error
                 "连接失败：${health.message}"
             }
             isBusy = false
@@ -177,15 +213,19 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            authActionState = ActionState.Loading
             authMessage = "正在检查登录状态..."
             try {
                 val status = api().authStatus()
                 authMessage = if (status.loggedIn) {
+                    authActionState = ActionState.Success
                     "已登录：${status.username}"
                 } else {
+                    authActionState = ActionState.Idle
                     "未登录，下一步：${status.nextAction.ifBlank { "扫码登录" }}"
                 }
             } catch (error: Exception) {
+                authActionState = ActionState.Error
                 authMessage = "检查失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -196,17 +236,21 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            authActionState = ActionState.Loading
             authMessage = "正在生成二维码..."
             try {
                 val qr = api().generateQrLogin()
                 qrLogin = qr
                 qrBitmap = qr.qrImageBase64.decodeBitmap()
                 authMessage = if (qr.ok) {
+                    authActionState = ActionState.Success
                     "二维码已生成，可扫码或打开 URL 登录"
                 } else {
+                    authActionState = ActionState.Error
                     "二维码生成失败：${qr.error}"
                 }
             } catch (error: Exception) {
+                authActionState = ActionState.Error
                 authMessage = "二维码生成失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -217,6 +261,7 @@ fun BiliBuyApp() {
         val qr = qrLogin ?: return
         scope.launch {
             isPolling = true
+            authActionState = ActionState.Loading
             authMessage = "正在等待扫码确认..."
             repeat(40) {
                 if (!isPolling) return@repeat
@@ -229,17 +274,21 @@ fun BiliBuyApp() {
                     }
                     if (result.ok) {
                         isPolling = false
+                        authActionState = ActionState.Success
                         qrLogin = null
                         qrBitmap = null
                         authMessage = "已成功登录：${result.username}，cookies ${result.cookiesCount} 条"
                         return@launch
                     }
                 } catch (error: Exception) {
+                    authActionState = ActionState.Error
                     authMessage = "轮询失败：${error.message ?: "服务器不可用"}"
                 }
                 delay(1_500)
             }
             isPolling = false
+            authActionState = ActionState.Error
+            authMessage = "登录确认超时，请重新扫码或继续轮询"
         }
     }
 
@@ -299,17 +348,58 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            filesActionState = ActionState.Loading
             filesMessage = "正在加载配置文件和绑定关系..."
             try {
                 val files = api().configList()
                 val bindings = api().configBindings(bindingUsernameFilter.takeIf { it.isNotBlank() })
                 configFiles = files
                 configBindings = bindings
+                filesActionState = ActionState.Success
                 filesMessage = "已加载：配置 ${files.size} 个，绑定 ${bindings.size} 条"
             } catch (error: Exception) {
+                filesActionState = ActionState.Error
                 filesMessage = "加载失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
+        }
+    }
+
+    fun updateManagedTaskStatus(status: ManagedTaskStatus, fallbackRunId: String) {
+        currentManagedRunId = status.runId.ifBlank { fallbackRunId }
+        managedTaskStatus = status
+        taskActionState = status.toActionState()
+        taskMessage = "当前状态：${status.status.ifBlank { "未知" }}"
+    }
+
+    fun stopManagedTaskPolling() {
+        managedTaskPollingJob?.cancel()
+        managedTaskPollingJob = null
+        isTaskPolling = false
+    }
+
+    fun startManagedTaskPolling(runId: String) {
+        if (runId.isBlank()) return
+        managedTaskPollingJob?.cancel()
+        managedTaskPollingJob = scope.launch {
+            isTaskPolling = true
+            var consecutiveErrors = 0
+            while (true) {
+                try {
+                    val status = api().managedTaskStatus(runId)
+                    consecutiveErrors = 0
+                    updateManagedTaskStatus(status, runId)
+                    if (status.isTerminal()) break
+                } catch (error: Exception) {
+                    consecutiveErrors += 1
+                    taskActionState = ActionState.Error
+                    taskMessage = "查询失败：${error.message ?: "服务器不可用"}"
+                    if (consecutiveErrors >= 5) break
+                }
+                delay(1_500)
+            }
+            isTaskPolling = false
+            managedTaskPollingJob = null
         }
     }
 
@@ -317,6 +407,7 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            taskActionState = ActionState.Loading
             taskMessage = "正在加载配置文件..."
             try {
                 val files = api().configList()
@@ -326,8 +417,10 @@ fun BiliBuyApp() {
                         file.path.ifBlank { file.filename }
                     }.orEmpty()
                 }
+                taskActionState = ActionState.Success
                 taskMessage = "已加载 ${files.size} 个配置文件"
             } catch (error: Exception) {
+                taskActionState = ActionState.Error
                 taskMessage = "加载失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -342,7 +435,9 @@ fun BiliBuyApp() {
         }
         saveServerUrl()
         scope.launch {
+            stopManagedTaskPolling()
             isBusy = true
+            taskActionState = ActionState.Loading
             taskMessage = "正在启动托管抢票任务..."
             try {
                 val result = api().startManagedTask(
@@ -352,10 +447,14 @@ fun BiliBuyApp() {
                     httpsProxys = taskProxy.trim(),
                     runId = taskRunIdInput.takeIf { it.isNotBlank() }
                 )
-                currentManagedRunId = result.runId
+                val startedRunId = result.runId
+                    .ifBlank { taskRunIdInput.trim() }
+                    .ifBlank { result.runDir.runIdFromPath() }
+                currentManagedRunId = startedRunId
+                taskRunIdInput = startedRunId.ifBlank { taskRunIdInput }
                 managedTaskStatus = ManagedTaskStatus(
                     ok = result.ok,
-                    runId = result.runId,
+                    runId = startedRunId,
                     status = "pending",
                     detail = "",
                     pid = result.pid,
@@ -366,11 +465,15 @@ fun BiliBuyApp() {
                     resultPath = result.runDir
                 )
                 taskMessage = if (result.ok) {
-                    "启动成功：${result.runId}"
+                    taskActionState = ActionState.Loading
+                    startManagedTaskPolling(startedRunId)
+                    "启动成功：${startedRunId.ifBlank { "等待 run_id" }}"
                 } else {
+                    taskActionState = ActionState.Error
                     "启动失败：${result.error}"
                 }
             } catch (error: Exception) {
+                taskActionState = ActionState.Error
                 taskMessage = "启动失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -386,13 +489,13 @@ fun BiliBuyApp() {
         saveServerUrl()
         scope.launch {
             isBusy = true
+            taskActionState = ActionState.Loading
             taskMessage = "正在查询任务状态..."
             try {
                 val status = api().managedTaskStatus(runId.trim())
-                currentManagedRunId = status.runId.ifBlank { runId.trim() }
-                managedTaskStatus = status
-                taskMessage = "当前状态：${status.status.ifBlank { "未知" }}"
+                updateManagedTaskStatus(status, runId.trim())
             } catch (error: Exception) {
+                taskActionState = ActionState.Error
                 taskMessage = "查询失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -407,13 +510,17 @@ fun BiliBuyApp() {
         }
         saveServerUrl()
         scope.launch {
+            stopManagedTaskPolling()
             isBusy = true
+            taskActionState = ActionState.Loading
             taskMessage = "正在取消任务..."
             try {
                 val status = api().cancelManagedTask(runId.trim())
-                managedTaskStatus = status
+                updateManagedTaskStatus(status, runId.trim())
+                taskActionState = ActionState.Error
                 taskMessage = "取消请求已发送：${status.runId.ifBlank { runId }}"
             } catch (error: Exception) {
+                taskActionState = ActionState.Error
                 taskMessage = "取消失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
@@ -447,14 +554,29 @@ fun BiliBuyApp() {
             when (currentTab) {
                 AppTab.Settings -> SettingsScreen(
                     serverUrl = serverUrl,
-                    onServerUrlChange = { serverUrl = it },
+                    customServerUrl = customServerUrl,
+                    useCustomServer = useCustomServer,
+                    onUseCustomServerChange = { useCustom ->
+                        useCustomServer = useCustom
+                        serverUrl = if (useCustom) customServerUrl else DEFAULT_SERVER_URL
+                        serverConnectionState = ActionState.Idle
+                        healthMessage = "未测试连接"
+                    },
+                    onCustomServerUrlChange = { url ->
+                        customServerUrl = url
+                        if (useCustomServer) serverUrl = url
+                        serverConnectionState = ActionState.Idle
+                        healthMessage = "未测试连接"
+                    },
                     healthMessage = healthMessage,
+                    connectionState = serverConnectionState,
                     isBusy = isBusy,
                     onTest = ::runHealthCheck
                 )
 
                 AppTab.Login -> LoginScreen(
                     authMessage = authMessage,
+                    actionState = authActionState,
                     qrBitmap = qrBitmap,
                     qrLogin = qrLogin,
                     isBusy = isBusy,
@@ -490,6 +612,7 @@ fun BiliBuyApp() {
                     contactTel = contactTel,
                     onContactTelChange = { contactTel = it },
                     projectMessage = projectMessage,
+                    actionState = projectMessage.toActionState(),
                     isBusy = isBusy,
                     canGenerate = selectedTicketIndex >= 0 &&
                         selectedBuyerIndices.isNotEmpty() &&
@@ -504,6 +627,7 @@ fun BiliBuyApp() {
                     configFiles = configFiles,
                     configBindings = configBindings,
                     filesMessage = filesMessage,
+                    actionState = filesActionState,
                     usernameFilter = bindingUsernameFilter,
                     onUsernameFilterChange = { bindingUsernameFilter = it },
                     isBusy = isBusy,
@@ -523,7 +647,9 @@ fun BiliBuyApp() {
                     runIdInput = taskRunIdInput,
                     onRunIdInputChange = { taskRunIdInput = it },
                     taskMessage = taskMessage,
+                    actionState = taskActionState,
                     status = managedTaskStatus,
+                    isPolling = isTaskPolling,
                     isBusy = isBusy,
                     onLoadConfigs = ::loadConfigFilesForTask,
                     onStart = ::startManagedTask,
@@ -560,31 +686,60 @@ private fun AppHeader(title: String) {
 @Composable
 private fun SettingsScreen(
     serverUrl: String,
-    onServerUrlChange: (String) -> Unit,
+    customServerUrl: String,
+    useCustomServer: Boolean,
+    onUseCustomServerChange: (Boolean) -> Unit,
+    onCustomServerUrlChange: (String) -> Unit,
     healthMessage: String,
+    connectionState: ActionState,
     isBusy: Boolean,
     onTest: () -> Unit
 ) {
     ScreenList {
         item {
             SectionCard(title = "API 服务器") {
-                OutlinedTextField(
-                    value = serverUrl,
-                    onValueChange = onServerUrlChange,
-                    label = { Text("服务器地址") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
+                RadioRow(
+                    selected = !useCustomServer,
+                    onClick = { onUseCustomServerChange(false) },
+                    title = "默认服务器",
+                    subtitle = DEFAULT_SERVER_URL
+                )
+                RadioRow(
+                    selected = useCustomServer,
+                    onClick = { onUseCustomServerChange(true) },
+                    title = "自定义服务器",
+                    subtitle = customServerUrl.ifBlank { "添加自定义 API 地址" }
+                )
+                if (useCustomServer) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    OutlinedTextField(
+                        value = customServerUrl,
+                        onValueChange = onCustomServerUrlChange,
+                        label = { Text("自定义服务器地址") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                Text(
+                    text = "当前地址：$serverUrl",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp)
                 )
                 Spacer(modifier = Modifier.height(10.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Button(
                         onClick = onTest,
                         enabled = !isBusy && serverUrl.isNotBlank()
                     ) {
-                        Text("保存并测试")
+                        Text("连接")
                     }
+                    ActionIndicator(state = connectionState)
                 }
-                StatusText(healthMessage)
+                ActionStatus(message = healthMessage, state = connectionState)
             }
         }
     }
@@ -593,6 +748,7 @@ private fun SettingsScreen(
 @Composable
 private fun LoginScreen(
     authMessage: String,
+    actionState: ActionState,
     qrBitmap: Bitmap?,
     qrLogin: QrLogin?,
     isBusy: Boolean,
@@ -620,7 +776,7 @@ private fun LoginScreen(
                         Text("生成二维码")
                     }
                 }
-                StatusText(authMessage)
+                ActionStatus(message = authMessage, state = actionState)
                 if (isPolling) {
                     Spacer(modifier = Modifier.height(10.dp))
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -707,6 +863,7 @@ private fun ConfigScreen(
     contactTel: String,
     onContactTelChange: (String) -> Unit,
     projectMessage: String,
+    actionState: ActionState,
     isBusy: Boolean,
     canGenerate: Boolean,
     onLoadContext: () -> Unit,
@@ -753,7 +910,7 @@ private fun ConfigScreen(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp)
                 )
-                StatusText(projectMessage)
+                ActionStatus(message = projectMessage, state = actionState)
             }
         }
 
@@ -942,6 +1099,7 @@ private fun FilesScreen(
     configFiles: List<ConfigFile>,
     configBindings: List<ConfigBinding>,
     filesMessage: String,
+    actionState: ActionState,
     usernameFilter: String,
     onUsernameFilterChange: (String) -> Unit,
     isBusy: Boolean,
@@ -965,7 +1123,7 @@ private fun FilesScreen(
                 ) {
                     Text("刷新配置和绑定")
                 }
-                StatusText(filesMessage)
+                ActionStatus(message = filesMessage, state = actionState)
                 if (configFiles.isNotEmpty()) {
                     OptionDivider()
                     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -1049,7 +1207,9 @@ private fun TaskScreen(
     runIdInput: String,
     onRunIdInputChange: (String) -> Unit,
     taskMessage: String,
+    actionState: ActionState,
     status: ManagedTaskStatus?,
+    isPolling: Boolean,
     isBusy: Boolean,
     onLoadConfigs: () -> Unit,
     onStart: () -> Unit,
@@ -1066,7 +1226,7 @@ private fun TaskScreen(
                 ) {
                     Text("刷新配置文件")
                 }
-                StatusText(taskMessage)
+                ActionStatus(message = taskMessage, state = actionState)
                 if (configFiles.isEmpty()) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
@@ -1181,23 +1341,15 @@ private fun TaskScreen(
                     return@SectionCard
                 }
                 OptionDivider()
+                if (isPolling) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    Spacer(modifier = Modifier.height(10.dp))
+                }
                 Text(
                     text = "${status.runId.ifBlank { runIdInput }} · ${status.status.ifBlank { "未知" }}",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
-                val details = listOfNotNull(
-                    status.detail.takeIf { it.isNotBlank() },
-                    status.pid.takeIf { it > 0 }?.let { "pid $it" },
-                    status.lastMessage.takeIf { it.isNotBlank() }
-                )
-                if (details.isNotEmpty()) {
-                    Text(
-                        text = details.joinToString(" · "),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
                 val paymentUrl = status.paymentUrl()
                 if (status.isTicketSecured(paymentUrl)) {
                     Spacer(modifier = Modifier.height(12.dp))
@@ -1255,16 +1407,6 @@ private fun TaskScreen(
                 }
                 if (status.error.isNotBlank()) {
                     StatusText("错误：${status.error}")
-                }
-                if (status.logsPath.isNotBlank() || status.resultPath.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Text(
-                        text = listOf(status.logsPath, status.resultPath)
-                            .filter { it.isNotBlank() }
-                            .joinToString("\n"),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
                 }
             }
         }
@@ -1393,6 +1535,54 @@ private fun StatusText(text: String) {
 }
 
 @Composable
+private fun ActionStatus(
+    message: String,
+    state: ActionState,
+    modifier: Modifier = Modifier
+) {
+    if (message.isBlank()) return
+    Spacer(modifier = Modifier.height(8.dp))
+    Row(
+        modifier = modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        ActionIndicator(state = state)
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodySmall,
+            color = when (state) {
+                ActionState.Success -> Color(0xFF138A36)
+                ActionState.Error -> MaterialTheme.colorScheme.error
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            },
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+@Composable
+private fun ActionIndicator(state: ActionState) {
+    val color = when (state) {
+        ActionState.Success -> Color(0xFF138A36)
+        ActionState.Error -> MaterialTheme.colorScheme.error
+        ActionState.Loading -> MaterialTheme.colorScheme.primary
+        ActionState.Idle -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Text(
+        text = when (state) {
+            ActionState.Success -> "➜"
+            ActionState.Error -> "!"
+            ActionState.Loading -> "…"
+            ActionState.Idle -> "○"
+        },
+        style = MaterialTheme.typography.titleMedium,
+        fontWeight = FontWeight.Bold,
+        color = color
+    )
+}
+
+@Composable
 private fun OptionDivider() {
     Spacer(modifier = Modifier.height(14.dp))
     HorizontalDivider()
@@ -1475,6 +1665,61 @@ private fun ManagedTaskStatus.isTicketSecured(paymentUrl: String = paymentUrl())
     return securedKeywords.any { it in text }
 }
 
+private fun ManagedTaskStatus.isTerminal(): Boolean {
+    if (isTicketSecured()) return true
+    val text = listOf(status, detail, lastMessage, error).joinToString(" ").lowercase()
+    if (text.isBlank()) return false
+    val terminalKeywords = listOf(
+        "success",
+        "succeeded",
+        "paid",
+        "pending_payment",
+        "failed",
+        "failure",
+        "error",
+        "cancel",
+        "cancelled",
+        "timeout",
+        "done",
+        "finished",
+        "成功",
+        "已抢到",
+        "待支付",
+        "失败",
+        "错误",
+        "取消",
+        "已取消",
+        "超时",
+        "结束",
+        "完成"
+    )
+    return terminalKeywords.any { it in text }
+}
+
+private fun ManagedTaskStatus.toActionState(): ActionState {
+    if (isTicketSecured()) return ActionState.Success
+    val text = listOf(status, detail, lastMessage, error).joinToString(" ").lowercase()
+    val errorKeywords = listOf("failed", "failure", "error", "cancel", "timeout", "失败", "错误", "取消", "超时")
+    return when {
+        errorKeywords.any { it in text } -> ActionState.Error
+        isTerminal() -> ActionState.Success
+        else -> ActionState.Loading
+    }
+}
+
+private fun String.toActionState(): ActionState {
+    if (isBlank()) return ActionState.Idle
+    val text = lowercase()
+    val errorKeywords = listOf("失败", "错误", "不可用", "fail", "error")
+    val successKeywords = listOf("成功", "已加载", "已生成", "已登录", "已连接", "success")
+    return when {
+        errorKeywords.any { it in text } -> ActionState.Error
+        successKeywords.any { it in text } -> ActionState.Success
+        text.startsWith("正在") -> ActionState.Loading
+        else -> ActionState.Idle
+    }
+}
+
 private fun String.toQrBitmap(size: Int = 720): Bitmap? {
     if (!isRealUrl()) return null
     return try {
@@ -1486,6 +1731,14 @@ private fun String.toQrBitmap(size: Int = 720): Bitmap? {
 
 private fun String.cleanUrl(): String {
     return trim().trimEnd('。', '，', ',', ';', '；', ')', '）')
+}
+
+private fun String.runIdFromPath(): String {
+    if (isBlank()) return ""
+    return trim()
+        .replace('\\', '/')
+        .trimEnd('/')
+        .substringAfterLast('/')
 }
 
 private fun String.isRealUrl(): Boolean {
