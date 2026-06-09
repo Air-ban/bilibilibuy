@@ -107,17 +107,6 @@ data class ConfigFile(
     val boundAt: String
 )
 
-data class ConfigBinding(
-    val username: String,
-    val filename: String,
-    val path: String,
-    val detail: String,
-    val projectId: Long,
-    val screenId: Long,
-    val skuId: Long,
-    val boundAt: String
-)
-
 data class ManagedTaskStartResult(
     val ok: Boolean,
     val runId: String,
@@ -287,19 +276,6 @@ class BiliApiClient(private val baseUrl: String) {
         }
     }
 
-    suspend fun configBindings(username: String? = null): List<ConfigBinding> {
-        val path = if (username.isNullOrBlank()) {
-            "/api/config/bindings"
-        } else {
-            "/api/config/bindings?username=${username.urlEncode()}"
-        }
-        val json = getJson(path)
-        val bindings = json.optJSONArray("bindings") ?: JSONArray()
-        return List(bindings.length()) { index ->
-            (bindings.optJSONObject(index) ?: JSONObject()).toConfigBinding()
-        }
-    }
-
     suspend fun startManagedTask(
         configFile: String,
         timeStart: String,
@@ -420,19 +396,6 @@ class BiliApiClient(private val baseUrl: String) {
     private fun buildUrl(path: String): String {
         return baseUrl.trim().trimEnd('/') + "/" + path.trimStart('/')
     }
-}
-
-private fun JSONObject.toConfigBinding(): ConfigBinding {
-    return ConfigBinding(
-        username = optString("username"),
-        filename = optString("filename"),
-        path = optString("path"),
-        detail = optString("detail"),
-        projectId = optLong("project_id"),
-        screenId = optLong("screen_id"),
-        skuId = optLong("sku_id"),
-        boundAt = optString("bound_at")
-    )
 }
 
 private fun String.urlEncode(): String = URLEncoder.encode(this, Charsets.UTF_8.name())

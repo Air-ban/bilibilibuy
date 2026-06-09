@@ -24,10 +24,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.text.selection.SelectionContainer
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.CardDefaults
@@ -95,9 +93,7 @@ private enum class AppTab(
     Settings("服务器设置", "设置", "S"),
     Login("账号登录", "登录", "L"),
     Config("配置生成", "配置", "C"),
-    Files("配置文件", "文件", "F"),
-    Task("启动抢票", "抢票", "T"),
-    Result("生成结果", "结果", "R")
+    Task("启动抢票", "抢票", "T")
 }
 
 private enum class ActionState {
@@ -119,7 +115,6 @@ fun BiliBuyApp() {
     val initialServerUrl = remember {
         prefs.getString(KEY_SERVER_URL, DEFAULT_SERVER_URL) ?: DEFAULT_SERVER_URL
     }
-    var serverUrl by remember { mutableStateOf(initialServerUrl) }
     var customServerUrl by remember {
         mutableStateOf(
             prefs.getString(KEY_CUSTOM_SERVER_URL, "")?.ifBlank {
@@ -146,13 +141,8 @@ fun BiliBuyApp() {
     var selectedAddressIndex by remember { mutableIntStateOf(-1) }
     var contactName by remember { mutableStateOf("") }
     var contactTel by remember { mutableStateOf("") }
-    var configResult by remember { mutableStateOf<ConfigGenerateResult?>(null) }
     var projectMessage by remember { mutableStateOf("") }
     var configFiles by remember { mutableStateOf<List<ConfigFile>>(emptyList()) }
-    var configBindings by remember { mutableStateOf<List<ConfigBinding>>(emptyList()) }
-    var filesMessage by remember { mutableStateOf("未加载配置文件") }
-    var filesActionState by remember { mutableStateOf(ActionState.Idle) }
-    var bindingUsernameFilter by remember { mutableStateOf("") }
     var selectedTaskConfig by remember { mutableStateOf("") }
     var taskTimeStart by remember { mutableStateOf("") }
     var taskInterval by remember { mutableStateOf("1000") }
@@ -171,7 +161,6 @@ fun BiliBuyApp() {
 
     fun saveServerUrl() {
         val selectedUrl = activeServerUrl()
-        serverUrl = selectedUrl
         prefs.edit()
             .putString(KEY_SERVER_URL, selectedUrl)
             .putString(KEY_CUSTOM_SERVER_URL, customServerUrl.trim())
@@ -188,7 +177,6 @@ fun BiliBuyApp() {
             ?: contactName
         contactTel = contextData.addresses.firstOrNull()?.phone ?: contactTel
         selectedDate = contextData.selectedDate.ifBlank { selectedDate }
-        configResult = null
     }
 
     fun runHealthCheck() {
@@ -330,36 +318,13 @@ fun BiliBuyApp() {
                     phone = phone.trim(),
                     purchaseContext = purchaseContext
                 )
-                configResult = result
                 projectMessage = if (result.ok) {
                     "配置生成成功"
                 } else {
                     "配置生成失败：${result.error}"
                 }
-                currentTab = AppTab.Result
             } catch (error: Exception) {
                 projectMessage = "生成失败：${error.message ?: "服务器不可用"}"
-            }
-            isBusy = false
-        }
-    }
-
-    fun loadConfigFilesAndBindings() {
-        saveServerUrl()
-        scope.launch {
-            isBusy = true
-            filesActionState = ActionState.Loading
-            filesMessage = "正在加载配置文件和绑定关系..."
-            try {
-                val files = api().configList()
-                val bindings = api().configBindings(bindingUsernameFilter.takeIf { it.isNotBlank() })
-                configFiles = files
-                configBindings = bindings
-                filesActionState = ActionState.Success
-                filesMessage = "已加载：配置 ${files.size} 个，绑定 ${bindings.size} 条"
-            } catch (error: Exception) {
-                filesActionState = ActionState.Error
-                filesMessage = "加载失败：${error.message ?: "服务器不可用"}"
             }
             isBusy = false
         }
@@ -531,6 +496,12 @@ fun BiliBuyApp() {
         checkAuthStatus()
     }
 
+    LaunchedEffect(currentTab) {
+        if (currentTab == AppTab.Task) {
+            loadConfigFilesForTask()
+        }
+    }
+
     Scaffold(
         bottomBar = {
             NavigationBar {
@@ -553,18 +524,15 @@ fun BiliBuyApp() {
             AppHeader(currentTab.title)
             when (currentTab) {
                 AppTab.Settings -> SettingsScreen(
-                    serverUrl = serverUrl,
                     customServerUrl = customServerUrl,
                     useCustomServer = useCustomServer,
                     onUseCustomServerChange = { useCustom ->
                         useCustomServer = useCustom
-                        serverUrl = if (useCustom) customServerUrl else DEFAULT_SERVER_URL
                         serverConnectionState = ActionState.Idle
                         healthMessage = "未测试连接"
                     },
                     onCustomServerUrlChange = { url ->
                         customServerUrl = url
-                        if (useCustomServer) serverUrl = url
                         serverConnectionState = ActionState.Idle
                         healthMessage = "未测试连接"
                     },
@@ -623,17 +591,6 @@ fun BiliBuyApp() {
                     onGenerateConfig = ::generateConfig
                 )
 
-                AppTab.Files -> FilesScreen(
-                    configFiles = configFiles,
-                    configBindings = configBindings,
-                    filesMessage = filesMessage,
-                    actionState = filesActionState,
-                    usernameFilter = bindingUsernameFilter,
-                    onUsernameFilterChange = { bindingUsernameFilter = it },
-                    isBusy = isBusy,
-                    onLoad = ::loadConfigFilesAndBindings
-                )
-
                 AppTab.Task -> TaskScreen(
                     configFiles = configFiles,
                     selectedConfig = selectedTaskConfig,
@@ -656,8 +613,6 @@ fun BiliBuyApp() {
                     onRefreshStatus = ::refreshManagedTaskStatus,
                     onCancel = ::cancelManagedTask
                 )
-
-                AppTab.Result -> ResultScreen(configResult = configResult)
             }
         }
     }
@@ -685,7 +640,6 @@ private fun AppHeader(title: String) {
 
 @Composable
 private fun SettingsScreen(
-    serverUrl: String,
     customServerUrl: String,
     useCustomServer: Boolean,
     onUseCustomServerChange: (Boolean) -> Unit,
@@ -702,7 +656,7 @@ private fun SettingsScreen(
                     selected = !useCustomServer,
                     onClick = { onUseCustomServerChange(false) },
                     title = "默认服务器",
-                    subtitle = DEFAULT_SERVER_URL
+                    subtitle = "使用内置 API 服务"
                 )
                 RadioRow(
                     selected = useCustomServer,
@@ -720,12 +674,6 @@ private fun SettingsScreen(
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-                Text(
-                    text = "当前地址：$serverUrl",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
                 Spacer(modifier = Modifier.height(10.dp))
                 Row(
                     horizontalArrangement = Arrangement.spacedBy(10.dp),
@@ -733,7 +681,7 @@ private fun SettingsScreen(
                 ) {
                     Button(
                         onClick = onTest,
-                        enabled = !isBusy && serverUrl.isNotBlank()
+                        enabled = !isBusy && (!useCustomServer || customServerUrl.isNotBlank())
                     ) {
                         Text("连接")
                     }
@@ -1095,105 +1043,6 @@ private fun ConfigScreen(
 }
 
 @Composable
-private fun FilesScreen(
-    configFiles: List<ConfigFile>,
-    configBindings: List<ConfigBinding>,
-    filesMessage: String,
-    actionState: ActionState,
-    usernameFilter: String,
-    onUsernameFilterChange: (String) -> Unit,
-    isBusy: Boolean,
-    onLoad: () -> Unit
-) {
-    ScreenList {
-        item {
-            SectionCard(title = "配置文件列表") {
-                OutlinedTextField(
-                    value = usernameFilter,
-                    onValueChange = onUsernameFilterChange,
-                    label = { Text("绑定账号筛选，可留空") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth()
-                )
-                Spacer(modifier = Modifier.height(10.dp))
-                Button(
-                    onClick = onLoad,
-                    enabled = !isBusy,
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("刷新配置和绑定")
-                }
-                ActionStatus(message = filesMessage, state = actionState)
-                if (configFiles.isNotEmpty()) {
-                    OptionDivider()
-                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        configFiles.forEach { file ->
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                Text(file.filename.ifBlank { "未命名配置" }, fontWeight = FontWeight.Medium)
-                                Text(
-                                    text = listOf(
-                                        file.accountUsername.takeIf { it.isNotBlank() }?.let { "账号 $it" },
-                                        file.boundAt.takeIf { it.isNotBlank() }?.let { "绑定 $it" }
-                                    ).filterNotNull().joinToString(" · ").ifBlank { file.path },
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                                if (file.path.isNotBlank()) {
-                                    Text(
-                                        text = file.path,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        item {
-            SectionCard(title = "绑定关系") {
-                if (configBindings.isEmpty()) {
-                    Text(
-                        text = "暂无绑定关系，刷新后查看 API 记录。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    return@SectionCard
-                }
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    configBindings.forEach { binding ->
-                        Column(modifier = Modifier.fillMaxWidth()) {
-                            Text(
-                                text = "${binding.filename} -> ${binding.username.ifBlank { "未绑定账号" }}",
-                                fontWeight = FontWeight.Medium
-                            )
-                            Text(
-                                text = binding.detail.ifBlank {
-                                    "project ${binding.projectId} / screen ${binding.screenId} / sku ${binding.skuId}"
-                                },
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            if (binding.boundAt.isNotBlank()) {
-                                Text(
-                                    text = "绑定时间：${binding.boundAt}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun TaskScreen(
     configFiles: List<ConfigFile>,
     selectedConfig: String,
@@ -1230,7 +1079,7 @@ private fun TaskScreen(
                 if (configFiles.isEmpty()) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Text(
-                        text = "还没有加载到配置文件。请先到“文件”页刷新，或在“配置”页生成配置文件。",
+                        text = "还没有加载到配置文件。进入本页会自动拉取；也可以先在“配置”页生成配置文件。",
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -1407,78 +1256,6 @@ private fun TaskScreen(
                 }
                 if (status.error.isNotBlank()) {
                     StatusText("错误：${status.error}")
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun ResultScreen(configResult: ConfigGenerateResult?) {
-    ScreenList {
-        item {
-            SectionCard(title = "配置文件") {
-                val result = configResult
-                if (result == null) {
-                    Text(
-                        text = "还没有生成配置。请到“配置”页完成项目、票档、购票人和地址选择。",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    return@SectionCard
-                }
-
-                if (result.configPath.isNotBlank()) {
-                    AssistChip(
-                        onClick = {},
-                        label = {
-                            Text(
-                                text = result.configPath,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis
-                            )
-                        }
-                    )
-                }
-                if (result.accountUsername.isNotBlank() || result.boundUsername.isNotBlank()) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp),
-                        modifier = Modifier.padding(top = 8.dp)
-                    ) {
-                        if (result.accountUsername.isNotBlank()) {
-                            AssistChip(
-                                onClick = {},
-                                label = { Text("账号 ${result.accountUsername}") }
-                            )
-                        }
-                        if (result.boundUsername.isNotBlank()) {
-                            AssistChip(
-                                onClick = {},
-                                label = { Text("绑定 ${result.boundUsername}") }
-                            )
-                        }
-                    }
-                }
-                if (result.errors.isNotEmpty()) {
-                    StatusText("错误：${result.errors.joinToString("；")}")
-                }
-                if (result.warnings.isNotEmpty()) {
-                    StatusText("警告：${result.warnings.joinToString("；")}")
-                }
-                if (result.configJson.isNotBlank()) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    SelectionContainer {
-                        Text(
-                            text = result.configJson,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(420.dp)
-                                .verticalScroll(rememberScrollState())
-                                .padding(8.dp)
-                        )
-                    }
                 }
             }
         }
