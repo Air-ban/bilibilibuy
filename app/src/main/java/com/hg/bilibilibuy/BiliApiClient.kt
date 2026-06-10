@@ -16,6 +16,8 @@ data class AuthStatus(
     val loggedIn: Boolean,
     val username: String,
     val hasCookies: Boolean,
+    val cookiesPath: String,
+    val configPath: String,
     val nextAction: String
 )
 
@@ -39,6 +41,7 @@ data class PollResult(
     val status: String,
     val message: String,
     val username: String,
+    val cookiesPath: String,
     val cookiesCount: Int
 )
 
@@ -130,7 +133,10 @@ data class ManagedTaskStatus(
     val resultPath: String
 )
 
-class BiliApiClient(private val baseUrl: String) {
+class BiliApiClient(
+    private val baseUrl: String,
+    private val cookiesPath: String = ""
+) {
     suspend fun health(): HealthStatus {
         return try {
             val json = getJson("/api/health")
@@ -146,18 +152,20 @@ class BiliApiClient(private val baseUrl: String) {
     }
 
     suspend fun authStatus(): AuthStatus {
-        val json = getJson("/api/auth/status")
+        val json = getJson(withCookiesPath("/api/auth/status"))
         return AuthStatus(
             ok = json.optBoolean("ok"),
             loggedIn = json.optBoolean("logged_in"),
             username = json.optString("username", "Not login"),
             hasCookies = json.optBoolean("has_cookies"),
+            cookiesPath = json.optString("cookies_path"),
+            configPath = json.optString("config_path"),
             nextAction = json.optString("next_action")
         )
     }
 
     suspend fun generateQrLogin(): QrLogin {
-        val json = postJson("/api/auth/qrcode/generate", JSONObject())
+        val json = postJson("/api/auth/qrcode/generate", JSONObject().withCookiesPath())
         return QrLogin(
             ok = json.optBoolean("ok"),
             loginUrl = json.optString("login_url"),
@@ -171,12 +179,14 @@ class BiliApiClient(private val baseUrl: String) {
         val body = JSONObject()
             .put("qrcode_key", qrcodeKey)
             .put("timeout_seconds", timeoutSeconds)
+            .withCookiesPath()
         val json = postJson("/api/auth/qrcode/poll", body)
         return PollResult(
             ok = json.optBoolean("ok"),
             status = json.optString("status"),
             message = json.optString("message"),
             username = json.optString("username"),
+            cookiesPath = json.optString("cookies_path"),
             cookiesCount = json.optJSONArray("cookies")?.length() ?: 0
         )
     }
@@ -189,6 +199,7 @@ class BiliApiClient(private val baseUrl: String) {
         val body = JSONObject()
             .put("project_input", projectInput)
             .put("phone", phone)
+            .withCookiesPath()
         if (!selectedDate.isNullOrBlank()) {
             body.put("selected_date", selectedDate)
         }
@@ -240,6 +251,7 @@ class BiliApiClient(private val baseUrl: String) {
             .put("tel", tel)
             .put("phone", phone)
             .put("save", true)
+            .withCookiesPath()
         if (!selectedDate.isNullOrBlank()) {
             body.put("selected_date", selectedDate)
         }
@@ -263,7 +275,7 @@ class BiliApiClient(private val baseUrl: String) {
     }
 
     suspend fun configList(): List<ConfigFile> {
-        val json = getJson("/api/config/list")
+        val json = getJson(withCookiesPath("/api/config/list"))
         val files = json.optJSONArray("files") ?: JSONArray()
         return List(files.length()) { index ->
             val item = files.optJSONObject(index) ?: JSONObject()
@@ -395,6 +407,20 @@ class BiliApiClient(private val baseUrl: String) {
 
     private fun buildUrl(path: String): String {
         return baseUrl.trim().trimEnd('/') + "/" + path.trimStart('/')
+    }
+
+    private fun JSONObject.withCookiesPath(): JSONObject {
+        if (cookiesPath.isNotBlank()) {
+            put("cookies_path", cookiesPath)
+        }
+        return this
+    }
+
+    private fun withCookiesPath(path: String): String {
+        val normalized = cookiesPath.trim()
+        if (normalized.isBlank()) return path
+        val separator = if ("?" in path) "&" else "?"
+        return "$path${separator}cookies_path=${normalized.urlEncode()}"
     }
 }
 

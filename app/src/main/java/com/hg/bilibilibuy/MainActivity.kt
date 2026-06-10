@@ -74,6 +74,7 @@ private const val PROJECT_REPOSITORY_URL = "https://github.com/Air-ban/bilibilib
 private const val PREFS_NAME = "bili_buy_settings"
 private const val KEY_SERVER_URL = "server_url"
 private const val KEY_CUSTOM_SERVER_URL = "custom_server_url"
+private const val KEY_COOKIES_PATH = "cookies_path"
 private val BILIBILI_APP_PACKAGES = listOf(
     "tv.danmaku.bili",
     "com.bilibili.app.in",
@@ -133,6 +134,7 @@ fun BiliBuyApp() {
         )
     }
     var useCustomServer by remember { mutableStateOf(initialServerUrl != DEFAULT_SERVER_URL) }
+    var cookiesPath by remember { mutableStateOf(prefs.getString(KEY_COOKIES_PATH, "") ?: "") }
     var healthMessage by remember { mutableStateOf("未测试连接") }
     var serverConnectionState by remember { mutableStateOf(ActionState.Idle) }
     var authMessage by remember { mutableStateOf("未检查登录状态") }
@@ -168,13 +170,14 @@ fun BiliBuyApp() {
 
     fun activeServerUrl() = if (useCustomServer) customServerUrl.trim() else DEFAULT_SERVER_URL
 
-    fun api() = BiliApiClient(activeServerUrl())
+    fun api() = BiliApiClient(activeServerUrl(), cookiesPath.trim())
 
     fun saveServerUrl() {
         val selectedUrl = activeServerUrl()
         prefs.edit()
             .putString(KEY_SERVER_URL, selectedUrl)
             .putString(KEY_CUSTOM_SERVER_URL, customServerUrl.trim())
+            .putString(KEY_COOKIES_PATH, cookiesPath.trim())
             .apply()
     }
 
@@ -218,10 +221,10 @@ fun BiliBuyApp() {
                 val status = api().authStatus()
                 authMessage = if (status.loggedIn) {
                     authActionState = ActionState.Success
-                    "已登录：${status.username}"
+                    "已登录：${status.username}${status.cookiesPath.displayPathSuffix()}"
                 } else {
                     authActionState = ActionState.Idle
-                    "未登录，下一步：${status.nextAction.ifBlank { "扫码登录" }}"
+                    "未登录，下一步：${status.nextAction.ifBlank { "扫码登录" }}${status.cookiesPath.displayPathSuffix()}"
                 }
             } catch (error: Exception) {
                 authActionState = ActionState.Error
@@ -231,8 +234,13 @@ fun BiliBuyApp() {
         }
     }
 
-    fun startQrPolling(qr: QrLogin? = qrLogin) {
+    fun startQrPolling(
+        qr: QrLogin? = qrLogin,
+        serverUrl: String = activeServerUrl(),
+        targetCookiesPath: String = cookiesPath.trim()
+    ) {
         val currentQr = qr?.takeIf { it.qrcodeKey.isNotBlank() } ?: return
+        val pollApi = BiliApiClient(serverUrl, targetCookiesPath)
         qrPollingJob?.cancel()
         qrPollingJob = scope.launch {
             isPolling = true
@@ -241,7 +249,7 @@ fun BiliBuyApp() {
             repeat(120) {
                 if (!isPolling) return@launch
                 try {
-                    val result = api().pollQrLogin(currentQr.qrcodeKey)
+                    val result = pollApi.pollQrLogin(currentQr.qrcodeKey)
                     authMessage = when {
                         result.ok -> "登录成功：${result.username}，cookies ${result.cookiesCount} 条"
                         result.status.isNotBlank() -> "${result.status}：${result.message}"
@@ -253,7 +261,7 @@ fun BiliBuyApp() {
                         authActionState = ActionState.Success
                         qrLogin = null
                         qrBitmap = null
-                        authMessage = "已成功登录：${result.username}，cookies ${result.cookiesCount} 条"
+                        authMessage = "已成功登录：${result.username}，cookies ${result.cookiesCount} 条${result.cookiesPath.displayPathSuffix()}"
                         return@launch
                     }
                 } catch (error: Exception) {
@@ -287,12 +295,13 @@ fun BiliBuyApp() {
             authActionState = ActionState.Loading
             authMessage = "正在生成二维码..."
             try {
-                val qr = api().generateQrLogin()
+                val loginApi = api()
+                val qr = loginApi.generateQrLogin()
                 qrLogin = qr
                 qrBitmap = qr.qrImageBase64.decodeBitmap()
                 if (qr.ok && qr.qrcodeKey.isNotBlank()) {
                     authMessage = "二维码已生成，正在自动等待确认..."
-                    startQrPolling(qr)
+                    startQrPolling(qr, activeServerUrl(), cookiesPath.trim())
                 } else {
                     authActionState = ActionState.Error
                     authMessage = "二维码生成失败：${qr.error.ifBlank { "缺少登录轮询 key" }}"
@@ -561,6 +570,19 @@ fun BiliBuyApp() {
                         serverConnectionState = ActionState.Idle
                         healthMessage = "未测试连接"
                     },
+                    cookiesPath = cookiesPath,
+                    onCookiesPathChange = { path ->
+                    cookiesPath = path
+                    prefs.edit().putString(KEY_COOKIES_PATH, path.trim()).apply()
+                    stopQrPolling()
+                    qrLogin = null
+                    qrBitmap = null
+                    authActionState = ActionState.Idle
+                    authMessage = "已切换用户 cookies_path，请检查登录状态"
+                        purchaseContext = null
+                        configFiles = emptyList()
+                        selectedTaskConfig = ""
+                    },
                     healthMessage = healthMessage,
                     connectionState = serverConnectionState,
                     isBusy = isBusy,
@@ -687,6 +709,8 @@ private fun SettingsScreen(
     useCustomServer: Boolean,
     onUseCustomServerChange: (Boolean) -> Unit,
     onCustomServerUrlChange: (String) -> Unit,
+    cookiesPath: String,
+    onCookiesPathChange: (String) -> Unit,
     healthMessage: String,
     connectionState: ActionState,
     isBusy: Boolean,
@@ -731,6 +755,24 @@ private fun SettingsScreen(
                     ActionIndicator(state = connectionState)
                 }
                 ActionStatus(message = healthMessage, state = connectionState)
+            }
+        }
+
+        item {
+            SectionCard(title = "用户隔离") {
+                OutlinedTextField(
+                    value = cookiesPath,
+                    onValueChange = onCookiesPathChange,
+                    label = { Text("cookies_path") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    text = "留空使用服务端默认 cookies.json；不同路径会隔离登录状态、配置绑定和通知配置。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 8.dp)
+                )
             }
         }
 
@@ -1540,6 +1582,10 @@ private fun String.toBiliAppLoginUris(): List<Uri> {
         Uri.parse("bilibili://browser?url=$encodedUrl"),
         Uri.parse("bilibili://browser/?url=$encodedUrl")
     )
+}
+
+private fun String.displayPathSuffix(): String {
+    return trim().takeIf { it.isNotBlank() }?.let { "（$it）" }.orEmpty()
 }
 
 private fun ManagedTaskStatus.paymentUrl(): String {
