@@ -41,7 +41,7 @@ data class PollResult(
     val status: String,
     val message: String,
     val username: String,
-    val cookiesPath: String,
+    val accessKey: String,
     val cookiesCount: Int
 )
 
@@ -135,7 +135,8 @@ data class ManagedTaskStatus(
 
 class BiliApiClient(
     private val baseUrl: String,
-    private val cookiesPath: String = ""
+    private val username: String = "",
+    private val accessKey: String = ""
 ) {
     suspend fun health(): HealthStatus {
         return try {
@@ -152,7 +153,7 @@ class BiliApiClient(
     }
 
     suspend fun authStatus(): AuthStatus {
-        val json = getJson(withCookiesPath("/api/auth/status"))
+        val json = getJson(withUserAuth("/api/auth/status"))
         return AuthStatus(
             ok = json.optBoolean("ok"),
             loggedIn = json.optBoolean("logged_in"),
@@ -165,7 +166,7 @@ class BiliApiClient(
     }
 
     suspend fun generateQrLogin(): QrLogin {
-        val json = postJson("/api/auth/qrcode/generate", JSONObject().withCookiesPath())
+        val json = postJson("/api/auth/qrcode/generate", JSONObject())
         return QrLogin(
             ok = json.optBoolean("ok"),
             loginUrl = json.optString("login_url"),
@@ -179,14 +180,13 @@ class BiliApiClient(
         val body = JSONObject()
             .put("qrcode_key", qrcodeKey)
             .put("timeout_seconds", timeoutSeconds)
-            .withCookiesPath()
         val json = postJson("/api/auth/qrcode/poll", body)
         return PollResult(
             ok = json.optBoolean("ok"),
             status = json.optString("status"),
             message = json.optString("message"),
             username = json.optString("username"),
-            cookiesPath = json.optString("cookies_path"),
+            accessKey = json.optString("access_key"),
             cookiesCount = json.optJSONArray("cookies")?.length() ?: 0
         )
     }
@@ -199,7 +199,7 @@ class BiliApiClient(
         val body = JSONObject()
             .put("project_input", projectInput)
             .put("phone", phone)
-            .withCookiesPath()
+            .withUserAuth()
         if (!selectedDate.isNullOrBlank()) {
             body.put("selected_date", selectedDate)
         }
@@ -251,7 +251,7 @@ class BiliApiClient(
             .put("tel", tel)
             .put("phone", phone)
             .put("save", true)
-            .withCookiesPath()
+            .withUserAuth()
         if (!selectedDate.isNullOrBlank()) {
             body.put("selected_date", selectedDate)
         }
@@ -275,7 +275,7 @@ class BiliApiClient(
     }
 
     suspend fun configList(): List<ConfigFile> {
-        val json = getJson(withCookiesPath("/api/config/list"))
+        val json = getJson(withUserAuth("/api/config/list"))
         val files = json.optJSONArray("files") ?: JSONArray()
         return List(files.length()) { index ->
             val item = files.optJSONObject(index) ?: JSONObject()
@@ -298,6 +298,7 @@ class BiliApiClient(
         val body = JSONObject()
             .put("config", configFile)
             .put("show_random_message", false)
+            .withUserAuth()
         if (timeStart.isNotBlank()) {
             body.put("time_start", timeStart)
         }
@@ -327,7 +328,7 @@ class BiliApiClient(
     }
 
     suspend fun managedTaskStatus(runId: String): ManagedTaskStatus {
-        val json = getJson("/api/task/managed/${runId.urlEncode()}/status")
+        val json = getJson(withUserAuth("/api/task/managed/${runId.urlEncode()}/status"))
         val run = json.optJSONObject("run") ?: JSONObject()
         return ManagedTaskStatus(
             ok = json.optBoolean("ok") && run.optBoolean("ok", true),
@@ -344,7 +345,10 @@ class BiliApiClient(
     }
 
     suspend fun cancelManagedTask(runId: String): ManagedTaskStatus {
-        val json = postJson("/api/task/managed/${runId.urlEncode()}/cancel", JSONObject())
+        val json = postJson(
+            withUserAuth("/api/task/managed/${runId.urlEncode()}/cancel"),
+            JSONObject()
+        )
         val run = json.optJSONObject("run") ?: JSONObject()
         return ManagedTaskStatus(
             ok = json.optBoolean("ok"),
@@ -409,18 +413,26 @@ class BiliApiClient(
         return baseUrl.trim().trimEnd('/') + "/" + path.trimStart('/')
     }
 
-    private fun JSONObject.withCookiesPath(): JSONObject {
-        if (cookiesPath.isNotBlank()) {
-            put("cookies_path", cookiesPath)
+    private fun JSONObject.withUserAuth(): JSONObject {
+        if (username.isNotBlank()) {
+            put("username", username)
+        }
+        if (accessKey.isNotBlank()) {
+            put("access_key", accessKey)
         }
         return this
     }
 
-    private fun withCookiesPath(path: String): String {
-        val normalized = cookiesPath.trim()
-        if (normalized.isBlank()) return path
+    private fun withUserAuth(path: String): String {
+        val normalized = username.trim()
+        val normalizedAccessKey = accessKey.trim()
+        val params = buildList {
+            if (normalized.isNotBlank()) add("username=${normalized.urlEncode()}")
+            if (normalizedAccessKey.isNotBlank()) add("access_key=${normalizedAccessKey.urlEncode()}")
+        }
+        if (params.isEmpty()) return path
         val separator = if ("?" in path) "&" else "?"
-        return "$path${separator}cookies_path=${normalized.urlEncode()}"
+        return "$path$separator${params.joinToString("&")}"
     }
 }
 

@@ -1,7 +1,10 @@
 package com.hg.bilibilibuy
 
+import android.app.Activity
+import android.app.ActivityManager
 import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -74,7 +77,8 @@ private const val PROJECT_REPOSITORY_URL = "https://github.com/Air-ban/bilibilib
 private const val PREFS_NAME = "bili_buy_settings"
 private const val KEY_SERVER_URL = "server_url"
 private const val KEY_CUSTOM_SERVER_URL = "custom_server_url"
-private const val KEY_COOKIES_PATH = "cookies_path"
+private const val KEY_ISOLATED_USERNAME = "isolated_username"
+private const val KEY_USER_ACCESS_KEY = "user_access_key"
 private val BILIBILI_APP_PACKAGES = listOf(
     "tv.danmaku.bili",
     "com.bilibili.app.in",
@@ -134,7 +138,12 @@ fun BiliBuyApp() {
         )
     }
     var useCustomServer by remember { mutableStateOf(initialServerUrl != DEFAULT_SERVER_URL) }
-    var cookiesPath by remember { mutableStateOf(prefs.getString(KEY_COOKIES_PATH, "") ?: "") }
+    var isolatedUsername by remember {
+        mutableStateOf(prefs.getString(KEY_ISOLATED_USERNAME, "") ?: "")
+    }
+    var userAccessKey by remember {
+        mutableStateOf(prefs.getString(KEY_USER_ACCESS_KEY, "") ?: "")
+    }
     var healthMessage by remember { mutableStateOf("未测试连接") }
     var serverConnectionState by remember { mutableStateOf(ActionState.Idle) }
     var authMessage by remember { mutableStateOf("未检查登录状态") }
@@ -149,6 +158,8 @@ fun BiliBuyApp() {
     var phone by remember { mutableStateOf("") }
     var selectedDate by remember { mutableStateOf("") }
     var purchaseContext by remember { mutableStateOf<PurchaseContext?>(null) }
+    var purchaseContextCacheKey by remember { mutableStateOf("") }
+    var loadedProjectInput by remember { mutableStateOf("") }
     var selectedTicketIndex by remember { mutableIntStateOf(-1) }
     val selectedBuyerIndices = remember { mutableStateListOf<Int>() }
     var selectedAddressIndex by remember { mutableIntStateOf(-1) }
@@ -170,14 +181,50 @@ fun BiliBuyApp() {
 
     fun activeServerUrl() = if (useCustomServer) customServerUrl.trim() else DEFAULT_SERVER_URL
 
-    fun api() = BiliApiClient(activeServerUrl(), cookiesPath.trim())
+    fun api() = BiliApiClient(activeServerUrl(), isolatedUsername.trim(), userAccessKey.trim())
+
+    fun rememberUserCredentials(username: String, accessKey: String = userAccessKey) {
+        val normalized = username.trim()
+        if (!normalized.isBiliUsername()) return
+        val normalizedAccessKey = accessKey.trim()
+        isolatedUsername = normalized
+        if (normalizedAccessKey.isNotBlank()) {
+            userAccessKey = normalizedAccessKey
+        }
+        prefs.edit()
+            .putString(KEY_ISOLATED_USERNAME, normalized)
+            .putString(KEY_USER_ACCESS_KEY, normalizedAccessKey)
+            .apply()
+    }
+
+    fun clearLocalUser() {
+        isolatedUsername = ""
+        userAccessKey = ""
+        prefs.edit()
+            .remove(KEY_ISOLATED_USERNAME)
+            .remove(KEY_USER_ACCESS_KEY)
+            .apply()
+        qrPollingJob?.cancel()
+        qrPollingJob = null
+        isPolling = false
+        qrLogin = null
+        qrBitmap = null
+        authActionState = ActionState.Idle
+        authMessage = "已清除本机账号，请重新登录"
+        purchaseContext = null
+        purchaseContextCacheKey = ""
+        loadedProjectInput = ""
+        configFiles = emptyList()
+        selectedTaskConfig = ""
+    }
 
     fun saveServerUrl() {
         val selectedUrl = activeServerUrl()
         prefs.edit()
             .putString(KEY_SERVER_URL, selectedUrl)
             .putString(KEY_CUSTOM_SERVER_URL, customServerUrl.trim())
-            .putString(KEY_COOKIES_PATH, cookiesPath.trim())
+            .putString(KEY_ISOLATED_USERNAME, isolatedUsername.trim())
+            .putString(KEY_USER_ACCESS_KEY, userAccessKey.trim())
             .apply()
     }
 
@@ -191,6 +238,29 @@ fun BiliBuyApp() {
             ?: contactName
         contactTel = contextData.addresses.firstOrNull()?.phone ?: contactTel
         selectedDate = contextData.selectedDate.ifBlank { selectedDate }
+    }
+
+    fun clearPurchaseContext(clearSelectedDate: Boolean = false) {
+        purchaseContext = null
+        purchaseContextCacheKey = ""
+        loadedProjectInput = ""
+        selectedTicketIndex = -1
+        selectedBuyerIndices.clear()
+        selectedAddressIndex = -1
+        if (clearSelectedDate) {
+            selectedDate = ""
+        }
+    }
+
+    fun purchaseContextKey(): String {
+        return listOf(
+            activeServerUrl(),
+            isolatedUsername.trim(),
+            userAccessKey.trim(),
+            projectInput.trim(),
+            selectedDate.trim(),
+            phone.trim()
+        ).joinToString("\u001F")
     }
 
     fun runHealthCheck() {
@@ -220,6 +290,7 @@ fun BiliBuyApp() {
             try {
                 val status = api().authStatus()
                 authMessage = if (status.loggedIn) {
+                    rememberUserCredentials(status.username)
                     authActionState = ActionState.Success
                     "已登录：${status.username}${status.cookiesPath.displayPathSuffix()}"
                 } else {
@@ -227,8 +298,14 @@ fun BiliBuyApp() {
                     "未登录，下一步：${status.nextAction.ifBlank { "扫码登录" }}${status.cookiesPath.displayPathSuffix()}"
                 }
             } catch (error: Exception) {
-                authActionState = ActionState.Error
-                authMessage = "检查失败：${error.message ?: "服务器不可用"}"
+                if (error.isInvalidAccessKey()) {
+                    clearLocalUser()
+                    authActionState = ActionState.Idle
+                    authMessage = "本机账号密钥已失效，请重新登录"
+                } else {
+                    authActionState = ActionState.Error
+                    authMessage = "检查失败：${error.message ?: "服务器不可用"}"
+                }
             }
             isBusy = false
         }
@@ -236,11 +313,10 @@ fun BiliBuyApp() {
 
     fun startQrPolling(
         qr: QrLogin? = qrLogin,
-        serverUrl: String = activeServerUrl(),
-        targetCookiesPath: String = cookiesPath.trim()
+        serverUrl: String = activeServerUrl()
     ) {
         val currentQr = qr?.takeIf { it.qrcodeKey.isNotBlank() } ?: return
-        val pollApi = BiliApiClient(serverUrl, targetCookiesPath)
+        val pollApi = BiliApiClient(serverUrl)
         qrPollingJob?.cancel()
         qrPollingJob = scope.launch {
             isPolling = true
@@ -256,12 +332,14 @@ fun BiliBuyApp() {
                         else -> result.message.ifBlank { "等待确认..." }
                     }
                     if (result.ok) {
+                        rememberUserCredentials(result.username, result.accessKey)
                         isPolling = false
                         qrPollingJob = null
                         authActionState = ActionState.Success
                         qrLogin = null
                         qrBitmap = null
-                        authMessage = "已成功登录：${result.username}，cookies ${result.cookiesCount} 条${result.cookiesPath.displayPathSuffix()}"
+                        authMessage = "已成功登录：${result.username}，cookies ${result.cookiesCount} 条${result.username.displayUsernameSuffix()}"
+                        context.returnToApp()
                         return@launch
                     }
                 } catch (error: Exception) {
@@ -301,7 +379,7 @@ fun BiliBuyApp() {
                 qrBitmap = qr.qrImageBase64.decodeBitmap()
                 if (qr.ok && qr.qrcodeKey.isNotBlank()) {
                     authMessage = "二维码已生成，正在自动等待确认..."
-                    startQrPolling(qr, activeServerUrl(), cookiesPath.trim())
+                    startQrPolling(qr, activeServerUrl())
                 } else {
                     authActionState = ActionState.Error
                     authMessage = "二维码生成失败：${qr.error.ifBlank { "缺少登录轮询 key" }}"
@@ -320,6 +398,13 @@ fun BiliBuyApp() {
             isBusy = true
             projectMessage = "正在获取项目上下文..."
             try {
+                val cacheKey = purchaseContextKey()
+                purchaseContext?.takeIf { purchaseContextCacheKey == cacheKey }?.let { data ->
+                    resetSelections(data)
+                    projectMessage = "已加载：${data.projectName}，票档 ${data.tickets.size} 个"
+                    isBusy = false
+                    return@launch
+                }
                 val data = api().purchaseContext(
                     projectInput.trim(),
                     selectedDate.takeIf { it.isNotBlank() },
@@ -327,9 +412,16 @@ fun BiliBuyApp() {
                 )
                 purchaseContext = data
                 resetSelections(data)
+                purchaseContextCacheKey = purchaseContextKey()
+                loadedProjectInput = projectInput.trim()
                 projectMessage = "已加载：${data.projectName}，票档 ${data.tickets.size} 个"
             } catch (error: Exception) {
-                projectMessage = "加载失败：${error.message ?: "服务器不可用"}"
+                if (error.isInvalidAccessKey()) {
+                    clearLocalUser()
+                    projectMessage = "本机账号密钥已失效，请重新登录"
+                } else {
+                    projectMessage = "加载失败：${error.message ?: "服务器不可用"}"
+                }
             }
             isBusy = false
         }
@@ -411,10 +503,14 @@ fun BiliBuyApp() {
             try {
                 val files = api().configList()
                 configFiles = files
-                if (selectedTaskConfig.isBlank()) {
-                    selectedTaskConfig = files.firstOrNull()?.let { file ->
-                        file.path.ifBlank { file.filename }
-                    }.orEmpty()
+                val currentName = selectedTaskConfig.configFilename()
+                selectedTaskConfig = if (
+                    currentName.isNotBlank() &&
+                    files.any { it.taskConfigName() == currentName }
+                ) {
+                    currentName
+                } else {
+                    files.firstOrNull()?.taskConfigName().orEmpty()
                 }
                 taskActionState = ActionState.Success
                 taskMessage = "已加载 ${files.size} 个配置文件"
@@ -570,19 +666,8 @@ fun BiliBuyApp() {
                         serverConnectionState = ActionState.Idle
                         healthMessage = "未测试连接"
                     },
-                    cookiesPath = cookiesPath,
-                    onCookiesPathChange = { path ->
-                    cookiesPath = path
-                    prefs.edit().putString(KEY_COOKIES_PATH, path.trim()).apply()
-                    stopQrPolling()
-                    qrLogin = null
-                    qrBitmap = null
-                    authActionState = ActionState.Idle
-                    authMessage = "已切换用户 cookies_path，请检查登录状态"
-                        purchaseContext = null
-                        configFiles = emptyList()
-                        selectedTaskConfig = ""
-                    },
+                    isolatedUsername = isolatedUsername,
+                    onClearLocalUser = ::clearLocalUser,
                     healthMessage = healthMessage,
                     connectionState = serverConnectionState,
                     isBusy = isBusy,
@@ -625,11 +710,23 @@ fun BiliBuyApp() {
 
                 AppTab.Config -> ConfigScreen(
                     projectInput = projectInput,
-                    onProjectInputChange = { projectInput = it },
+                    onProjectInputChange = {
+                        val shouldClearSelectedDate = purchaseContext != null &&
+                            loadedProjectInput.isNotBlank() &&
+                            it.trim() != loadedProjectInput
+                        projectInput = it
+                        clearPurchaseContext(clearSelectedDate = shouldClearSelectedDate)
+                    },
                     phone = phone,
-                    onPhoneChange = { phone = it },
+                    onPhoneChange = {
+                        phone = it
+                        clearPurchaseContext()
+                    },
                     selectedDate = selectedDate,
-                    onSelectedDateChange = { selectedDate = it },
+                    onSelectedDateChange = {
+                        selectedDate = it
+                        clearPurchaseContext()
+                    },
                     purchaseContext = purchaseContext,
                     selectedTicketIndex = selectedTicketIndex,
                     onSelectedTicketIndexChange = { selectedTicketIndex = it },
@@ -709,8 +806,8 @@ private fun SettingsScreen(
     useCustomServer: Boolean,
     onUseCustomServerChange: (Boolean) -> Unit,
     onCustomServerUrlChange: (String) -> Unit,
-    cookiesPath: String,
-    onCookiesPathChange: (String) -> Unit,
+    isolatedUsername: String,
+    onClearLocalUser: () -> Unit,
     healthMessage: String,
     connectionState: ActionState,
     isBusy: Boolean,
@@ -759,20 +856,23 @@ private fun SettingsScreen(
         }
 
         item {
-            SectionCard(title = "用户隔离") {
+            SectionCard(title = "当前账号") {
                 OutlinedTextField(
-                    value = cookiesPath,
-                    onValueChange = onCookiesPathChange,
-                    label = { Text("cookies_path") },
+                    value = isolatedUsername.ifBlank { "未登录" },
+                    onValueChange = {},
+                    label = { Text("当前 B站账号") },
+                    readOnly = true,
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
-                Text(
-                    text = "留空使用服务端默认 cookies.json；不同路径会隔离登录状态、配置绑定和通知配置。",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(top = 8.dp)
-                )
+                Spacer(modifier = Modifier.height(10.dp))
+                OutlinedButton(
+                    onClick = onClearLocalUser,
+                    enabled = isolatedUsername.isNotBlank() && !isBusy,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("清除本机账号")
+                }
             }
         }
 
@@ -951,7 +1051,7 @@ private fun ConfigScreen(
                 OutlinedTextField(
                     value = projectInput,
                     onValueChange = onProjectInputChange,
-                    label = { Text("演出 ID 或详情页 URL") },
+                    label = { Text("演出 ID、详情页 URL 或 b23.tv 短链") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -981,7 +1081,7 @@ private fun ConfigScreen(
                     Text("获取项目上下文")
                 }
                 Text(
-                    text = "日期支持 YYYY-MM-DD 或 YYYY/MM/DD；留空时后端会合并项目场次、每日场次和周边票档。",
+                    text = "支持 b23.tv 短链自动展开；日期支持 YYYY-MM-DD 或 YYYY/MM/DD，留空时后端会合并项目场次、每日场次和周边票档。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp)
@@ -1215,15 +1315,14 @@ private fun TaskScreen(
                     OptionDivider()
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         configFiles.forEach { file ->
-                            val configPath = file.path.ifBlank { file.filename }
+                            val configName = file.taskConfigName()
                             RadioRow(
-                                selected = selectedConfig == configPath,
-                                onClick = { onSelectedConfigChange(configPath) },
-                                title = file.filename.ifBlank { "未命名配置" },
+                                selected = selectedConfig.configFilename() == configName,
+                                onClick = { onSelectedConfigChange(configName) },
+                                title = configName.ifBlank { "未命名配置" },
                                 subtitle = listOf(
                                     file.accountUsername.takeIf { it.isNotBlank() }?.let { "账号 $it" },
-                                    file.boundAt.takeIf { it.isNotBlank() }?.let { "绑定 $it" },
-                                    file.path.takeIf { it.isNotBlank() }
+                                    file.boundAt.takeIf { it.isNotBlank() }?.let { "绑定 $it" }
                                 ).filterNotNull().joinToString(" · ")
                             )
                         }
@@ -1235,10 +1334,11 @@ private fun TaskScreen(
         item {
             SectionCard(title = "启动参数") {
                 OutlinedTextField(
-                    value = selectedConfig,
+                    value = selectedConfig.configFilename(),
                     onValueChange = onSelectedConfigChange,
-                    label = { Text("配置文件所在路径 *") },
+                    label = { Text("配置文件 *") },
                     singleLine = true,
+                    readOnly = true,
                     modifier = Modifier.fillMaxWidth()
                 )
                 Spacer(modifier = Modifier.height(10.dp))
@@ -1289,7 +1389,7 @@ private fun TaskScreen(
                     Text("启动托管抢票")
                 }
                 Text(
-                    text = "* 为必填项。配置列表选择时会传入服务端返回的 path；其它运行参数留空时使用后端默认值。",
+                    text = "* 为必填项。请选择已生成的配置文件；其它运行参数留空时使用后端默认值。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(top = 8.dp)
@@ -1537,13 +1637,13 @@ private fun Context.openBiliLoginUrl(url: String): Boolean {
         BILIBILI_APP_PACKAGES.any { packageName ->
             val intent = Intent(Intent.ACTION_VIEW, uri)
                 .addCategory(Intent.CATEGORY_BROWSABLE)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .withNewTaskWhenNeeded(this)
                 .setPackage(packageName)
             startActivitySafely(intent)
         } || startActivitySafely(
             Intent(Intent.ACTION_VIEW, uri)
                 .addCategory(Intent.CATEGORY_BROWSABLE)
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .withNewTaskWhenNeeded(this)
         )
     }
 }
@@ -1554,6 +1654,42 @@ private fun Context.openExternalUrl(url: String): Boolean {
         .addCategory(Intent.CATEGORY_BROWSABLE)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     return startActivitySafely(intent)
+}
+
+private fun Context.returnToApp(): Boolean {
+    val movedTask = try {
+        val activityManager = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        val task = activityManager?.appTasks?.firstOrNull()
+        if (task != null) {
+            task.moveToFront()
+            true
+        } else {
+            false
+        }
+    } catch (_: Exception) {
+        false
+    }
+    val intent = Intent(this, MainActivity::class.java)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        .addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT)
+    return startActivitySafely(intent) || movedTask
+}
+
+private fun Intent.withNewTaskWhenNeeded(context: Context): Intent {
+    if (context.findActivity() == null) {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    }
+    return this
+}
+
+private tailrec fun Context.findActivity(): Activity? {
+    return when (this) {
+        is Activity -> this
+        is ContextWrapper -> baseContext.findActivity()
+        else -> null
+    }
 }
 
 private fun Context.startActivitySafely(intent: Intent): Boolean {
@@ -1586,6 +1722,23 @@ private fun String.toBiliAppLoginUris(): List<Uri> {
 
 private fun String.displayPathSuffix(): String {
     return trim().takeIf { it.isNotBlank() }?.let { "（$it）" }.orEmpty()
+}
+
+private fun String.displayUsernameSuffix(): String {
+    return trim().takeIf { it.isNotBlank() }?.let { "（隔离用户：$it）" }.orEmpty()
+}
+
+private fun String.isBiliUsername(): Boolean {
+    val normalized = trim()
+    return normalized.isNotBlank() &&
+        normalized != "Not login" &&
+        normalized != "未登录" &&
+        normalized != "unknown-user"
+}
+
+private fun Throwable.isInvalidAccessKey(): Boolean {
+    val text = message.orEmpty()
+    return "HTTP 403" in text || "invalid user access key" in text
 }
 
 private fun ManagedTaskStatus.paymentUrl(): String {
@@ -1701,6 +1854,15 @@ private fun String.runIdFromPath(): String {
         .replace('\\', '/')
         .trimEnd('/')
         .substringAfterLast('/')
+}
+
+private fun String.configFilename(): String {
+    val normalized = trim().replace('\\', '/').trimEnd('/')
+    return normalized.substringAfterLast('/').ifBlank { normalized }
+}
+
+private fun ConfigFile.taskConfigName(): String {
+    return filename.ifBlank { path.configFilename() }
 }
 
 private fun String.isRealUrl(): Boolean {
