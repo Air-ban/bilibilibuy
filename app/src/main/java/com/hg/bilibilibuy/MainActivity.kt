@@ -1,5 +1,6 @@
 package com.hg.bilibilibuy
 
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
@@ -68,11 +69,17 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
-private const val DEFAULT_SERVER_URL = "http://10.0.2.2:8000"
+private const val DEFAULT_SERVER_URL = ""
 private const val PROJECT_REPOSITORY_URL = "https://github.com/Air-ban/bilibilibuy"
 private const val PREFS_NAME = "bili_buy_settings"
 private const val KEY_SERVER_URL = "server_url"
 private const val KEY_CUSTOM_SERVER_URL = "custom_server_url"
+private val BILIBILI_APP_PACKAGES = listOf(
+    "tv.danmaku.bili",
+    "com.bilibili.app.in",
+    "tv.danmaku.bilibilihd",
+    "com.bilibili.app.blue"
+)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -134,6 +141,7 @@ fun BiliBuyApp() {
     var qrBitmap by remember { mutableStateOf<Bitmap?>(null) }
     var isBusy by remember { mutableStateOf(false) }
     var isPolling by remember { mutableStateOf(false) }
+    var qrPollingJob by remember { mutableStateOf<Job?>(null) }
 
     var projectInput by remember { mutableStateOf("") }
     var phone by remember { mutableStateOf("") }
@@ -223,41 +231,17 @@ fun BiliBuyApp() {
         }
     }
 
-    fun generateQrLogin() {
-        saveServerUrl()
-        scope.launch {
-            isBusy = true
-            authActionState = ActionState.Loading
-            authMessage = "正在生成二维码..."
-            try {
-                val qr = api().generateQrLogin()
-                qrLogin = qr
-                qrBitmap = qr.qrImageBase64.decodeBitmap()
-                authMessage = if (qr.ok) {
-                    authActionState = ActionState.Success
-                    "二维码已生成，可扫码或打开 URL 登录"
-                } else {
-                    authActionState = ActionState.Error
-                    "二维码生成失败：${qr.error}"
-                }
-            } catch (error: Exception) {
-                authActionState = ActionState.Error
-                authMessage = "二维码生成失败：${error.message ?: "服务器不可用"}"
-            }
-            isBusy = false
-        }
-    }
-
-    fun startQrPolling() {
-        val qr = qrLogin ?: return
-        scope.launch {
+    fun startQrPolling(qr: QrLogin? = qrLogin) {
+        val currentQr = qr?.takeIf { it.qrcodeKey.isNotBlank() } ?: return
+        qrPollingJob?.cancel()
+        qrPollingJob = scope.launch {
             isPolling = true
             authActionState = ActionState.Loading
             authMessage = "正在等待扫码确认..."
-            repeat(40) {
-                if (!isPolling) return@repeat
+            repeat(120) {
+                if (!isPolling) return@launch
                 try {
-                    val result = api().pollQrLogin(qr.qrcodeKey)
+                    val result = api().pollQrLogin(currentQr.qrcodeKey)
                     authMessage = when {
                         result.ok -> "登录成功：${result.username}，cookies ${result.cookiesCount} 条"
                         result.status.isNotBlank() -> "${result.status}：${result.message}"
@@ -265,6 +249,7 @@ fun BiliBuyApp() {
                     }
                     if (result.ok) {
                         isPolling = false
+                        qrPollingJob = null
                         authActionState = ActionState.Success
                         qrLogin = null
                         qrBitmap = null
@@ -278,8 +263,45 @@ fun BiliBuyApp() {
                 delay(1_500)
             }
             isPolling = false
+            qrPollingJob = null
             authActionState = ActionState.Error
-            authMessage = "登录确认超时，请重新扫码或继续轮询"
+            authMessage = "登录确认超时，请重新生成二维码"
+        }
+    }
+
+    fun stopQrPolling() {
+        qrPollingJob?.cancel()
+        qrPollingJob = null
+        isPolling = false
+        if (qrLogin != null) {
+            authActionState = ActionState.Idle
+            authMessage = "已停止自动轮询，可重新生成二维码后自动重试"
+        }
+    }
+
+    fun generateQrLogin() {
+        saveServerUrl()
+        scope.launch {
+            stopQrPolling()
+            isBusy = true
+            authActionState = ActionState.Loading
+            authMessage = "正在生成二维码..."
+            try {
+                val qr = api().generateQrLogin()
+                qrLogin = qr
+                qrBitmap = qr.qrImageBase64.decodeBitmap()
+                if (qr.ok && qr.qrcodeKey.isNotBlank()) {
+                    authMessage = "二维码已生成，正在自动等待确认..."
+                    startQrPolling(qr)
+                } else {
+                    authActionState = ActionState.Error
+                    authMessage = "二维码生成失败：${qr.error.ifBlank { "缺少登录轮询 key" }}"
+                }
+            } catch (error: Exception) {
+                authActionState = ActionState.Error
+                authMessage = "二维码生成失败：${error.message ?: "服务器不可用"}"
+            }
+            isBusy = false
         }
     }
 
@@ -554,11 +576,29 @@ fun BiliBuyApp() {
                     isPolling = isPolling,
                     onCheckStatus = ::checkAuthStatus,
                     onGenerateQr = ::generateQrLogin,
-                    onOpenLoginUrl = { url ->
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                    onOpenBiliAppLogin = { url ->
+                        if (context.openBiliLoginUrl(url)) {
+                            authActionState = ActionState.Loading
+                            authMessage = "已跳转 B 站 APP，请确认登录后回到本应用等待结果"
+                            if (!isPolling) startQrPolling()
+                        } else if (context.openExternalUrl(url)) {
+                            authActionState = ActionState.Loading
+                            authMessage = "未找到可处理登录链接的 B 站 APP，已改用浏览器打开"
+                            if (!isPolling) startQrPolling()
+                        } else {
+                            authActionState = ActionState.Error
+                            authMessage = "无法打开登录链接，请检查是否安装浏览器或 B 站 APP"
+                        }
                     },
-                    onStartPolling = ::startQrPolling,
-                    onStopPolling = { isPolling = false }
+                    onOpenLoginUrl = { url ->
+                        if (context.openExternalUrl(url)) {
+                            if (!isPolling) startQrPolling()
+                        } else {
+                            authActionState = ActionState.Error
+                            authMessage = "无法打开登录链接，请检查是否安装浏览器"
+                        }
+                    },
+                    onStopPolling = ::stopQrPolling
                 )
 
                 AppTab.Config -> ConfigScreen(
@@ -696,6 +736,8 @@ private fun SettingsScreen(
 
         item {
             SectionCard(title = "关于项目") {
+                val context = LocalContext.current
+                val appVersion = remember(context) { context.appVersionName() }
                 Text(
                     text = "bilibilibuy 是用于配合 bilibili 购票 API 服务的 Android 客户端。",
                     style = MaterialTheme.typography.bodyMedium,
@@ -708,12 +750,11 @@ private fun SettingsScreen(
                     fontWeight = FontWeight.Medium
                 )
                 Text(
-                    text = "版本：v1.0",
+                    text = "版本：v$appVersion",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(12.dp))
-                val context = LocalContext.current
                 OutlinedButton(
                     onClick = {
                         context.startActivity(
@@ -745,8 +786,8 @@ private fun LoginScreen(
     isPolling: Boolean,
     onCheckStatus: () -> Unit,
     onGenerateQr: () -> Unit,
+    onOpenBiliAppLogin: (String) -> Unit,
     onOpenLoginUrl: (String) -> Unit,
-    onStartPolling: () -> Unit,
     onStopPolling: () -> Unit
 ) {
     ScreenList {
@@ -791,18 +832,21 @@ private fun LoginScreen(
                 }
 
                 qrLogin?.let { qr ->
-                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = { onOpenBiliAppLogin(qr.loginUrl) },
+                            enabled = qr.loginUrl.isNotBlank()
+                        ) {
+                            Text("B站 APP 登录")
+                        }
                         OutlinedButton(
                             onClick = { onOpenLoginUrl(qr.loginUrl) },
                             enabled = qr.loginUrl.isNotBlank()
                         ) {
                             Text("浏览器登录")
-                        }
-                        Button(
-                            onClick = onStartPolling,
-                            enabled = !isPolling && qr.qrcodeKey.isNotBlank()
-                        ) {
-                            Text("开始轮询")
                         }
                         if (isPolling) {
                             TextButton(onClick = onStopPolling) {
@@ -824,7 +868,7 @@ private fun LoginScreen(
                     text = if (authMessage.startsWith("已成功登录") || authMessage.startsWith("已登录")) {
                         "登录已完成，可以进入配置页选择演出。"
                     } else {
-                        "先生成二维码，再使用 B 站客户端扫码，或打开登录 URL 后回到应用轮询。"
+                        "生成二维码后会自动等待确认；可点 B站 APP 登录、浏览器登录，或直接扫码。"
                     },
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -1443,6 +1487,59 @@ private fun String.decodeBitmap(): Bitmap? {
     } catch (_: IllegalArgumentException) {
         null
     }
+}
+
+private fun Context.openBiliLoginUrl(url: String): Boolean {
+    if (!url.isRealUrl()) return false
+    return url.toBiliAppLoginUris().any { uri ->
+        BILIBILI_APP_PACKAGES.any { packageName ->
+            val intent = Intent(Intent.ACTION_VIEW, uri)
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .setPackage(packageName)
+            startActivitySafely(intent)
+        } || startActivitySafely(
+            Intent(Intent.ACTION_VIEW, uri)
+                .addCategory(Intent.CATEGORY_BROWSABLE)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        )
+    }
+}
+
+private fun Context.openExternalUrl(url: String): Boolean {
+    if (!url.isRealUrl()) return false
+    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+        .addCategory(Intent.CATEGORY_BROWSABLE)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    return startActivitySafely(intent)
+}
+
+private fun Context.startActivitySafely(intent: Intent): Boolean {
+    return try {
+        startActivity(intent)
+        true
+    } catch (_: ActivityNotFoundException) {
+        false
+    } catch (_: SecurityException) {
+        false
+    }
+}
+
+private fun Context.appVersionName(): String {
+    return try {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        info.versionName ?: "未知"
+    } catch (_: Exception) {
+        "未知"
+    }
+}
+
+private fun String.toBiliAppLoginUris(): List<Uri> {
+    val encodedUrl = Uri.encode(this)
+    return listOf(
+        Uri.parse("bilibili://browser?url=$encodedUrl"),
+        Uri.parse("bilibili://browser/?url=$encodedUrl")
+    )
 }
 
 private fun ManagedTaskStatus.paymentUrl(): String {
